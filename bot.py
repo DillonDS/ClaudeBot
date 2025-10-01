@@ -20,8 +20,8 @@ class ClaudeBot:
     def __init__(self):
         self.discord_token: Optional[str] = None
         self.claude_api_key: Optional[str] = None
-        self.claude_client: Optional[anthropic.Anthropic] = None
-        self.bot: Optional[commands.Bot] = None
+        self.claude_client: Optional[anthropic.Anthropic] = None # will become an Claude client object
+        self.bot: Optional[commands.Bot] = None # will become a Discord bot object 
         
     def get_claude_api_key(self) -> str:
         # Claude API key from either .env or AWS Secrets Manager
@@ -81,12 +81,38 @@ class ClaudeBot:
             intents.presences = True
             intents.guilds = True
             
-            self.bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)
+            self.bot = commands.Bot(command_prefix='/', intents=intents, help_command=None) # Discord bot object
         except Exception as e:
             logger.error(f"Error initializing clients: {e}")
             raise 
+    
+    def setup_events(self): 
+        @self.bot.event
+        async def on_ready():
+            logger.info(f"{self.bot.user} connected to Discord!")
+            try:
+                synced = await self.bot.tree.sync() # sync slash commands - CommandTree object
+                logger.info(f"Synced {len(synced)} slash commands")
+            except Exception as e:
+                logger.error(f"Failed to sync slash commands {e}")
+        
+        @self.bot.event
+        async def on_message(message: discord.Message):
+            if message.author == self.bot.user: # skip bot messages
+                return
+            
+            if self.bot.user in message.mentions: # if bot is mentioned
+                await self.handle_mention(message) 
+            
+            await self.moderate_message(message)
 
+            await self.bot.process_commands(message) 
 
+    async def handle_mention(self, message: discord.Message): # need to create
+        return
+    async def moderate_message(self, message: discord.Message): # need to create
+        return
+    
 def main():
     bot = ClaudeBot()
 
