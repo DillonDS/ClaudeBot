@@ -85,3 +85,10 @@ class ClaudeBot:
         except Exception as e:
             logger.error(f"Error initializing clients: {e}")
             raise 
+
+
+def main():
+    bot = ClaudeBot()
+
+if __name__ == "__main__":
+    main()
