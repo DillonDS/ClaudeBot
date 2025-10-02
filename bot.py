@@ -98,7 +98,7 @@ class ClaudeBot:
         
         @self.bot.event
         async def on_message(message: discord.Message):
-            if message.author == self.bot.user: # skip bot messages
+            if message.author.bot:  # skip all bot messages
                 return
             
             if self.bot.user in message.mentions: # if bot is mentioned
@@ -108,10 +108,21 @@ class ClaudeBot:
 
             await self.bot.process_commands(message) 
 
-    async def handle_mention(self, message: discord.Message): # need to create
+    async def handle_mention(self, message: discord.Message): 
+        try:
+            message_content = message.content.replace(f"@{self.bot.user.id}", "")
+        except Exception as e:
+            logger.error(f"Error handling mention: {e}")
+            await message.reply("I encountered an error processing your request.")
+        
+    
+    async def moderate_message(self, message: discord.Message): 
         return
     
-    async def moderate_message(self, message: discord.Message): # need to create
+    async def claude_response(self,): 
+        return
+    
+    def slash_commands(self):
         return
     
 def main():
