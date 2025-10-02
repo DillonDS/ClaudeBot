@@ -110,6 +110,7 @@ class ClaudeBot:
 
     async def handle_mention(self, message: discord.Message): # need to create
         return
+    
     async def moderate_message(self, message: discord.Message): # need to create
         return
     
