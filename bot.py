@@ -115,7 +115,7 @@ class ClaudeBot:
             # Message content logic 
             message_content = message.content.replace(f'<@{self.bot.user.id}>', '').strip()
             if not message_content and not message.attachments:
-                await message.reply("You mentioned me with an empty message bozo :RIPBOZO:")
+                await message.reply(f"You mentioned me with an empty message bozo <a:emote_name:1423865523011190795>")
                 return
             
             # Reply context logic
