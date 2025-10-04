@@ -9,6 +9,7 @@ import anthropic
 import boto3
 from dotenv import load_dotenv
 import base64
+from datetime import datetime, timezone
 
 # print(f"Current directory: {os.getcwd()}")
 # print(f".env exists: {os.path.exists('.env')}")
@@ -25,7 +26,8 @@ class ClaudeBot:
         self.claude_api_key: Optional[str] = None
         self.claude_client: Optional[anthropic.Anthropic] = None # will become an Claude client object
         self.bot: Optional[commands.Bot] = None # will become a Discord bot object 
-        
+        self.start_time: Optional[datetime] = None
+
     def get_claude_api_key(self) -> str:
         # Claude API key from either .env or AWS Secrets Manager
         
@@ -95,9 +97,16 @@ class ClaudeBot:
             try:
                 synced = await self.bot.tree.sync() # sync slash commands - CommandTree object
                 logger.info(f"Synced {len(synced)} slash commands")
+                
+                await self.bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for mentions"))
+
+                if self.start_time is None:
+                    self.start_time = datetime.now(timezone.utc)
+                    logger.info(f"Bot started at {self.start_time}")
+                
             except Exception as e:
-                logger.error(f"Failed to sync slash commands {e}")
-        
+                logger.error(f"Failed to setup events: {e}")
+
         @self.bot.event
         async def on_message(message: discord.Message):
             if message.author.bot:  # skip all bot messages
@@ -208,7 +217,18 @@ class ClaudeBot:
         async def ping_command(interaction: discord.Interaction):
             latency = round(self.bot.latency, 2)
             await interaction.response.send_message(f"Latency: {latency} seconds")
-    
+
+        @self.bot.tree.command(name="uptime", description="Check bot uptime")
+        async def uptime_command(interaction: discord.Interaction):
+           if self.start_time:
+               current_time = datetime.now(timezone.utc)
+               uptime_delta = current_time - self.start_time
+               days, seconds = uptime_delta.days, uptime_delta.seconds
+               hours, minutes = divmod(seconds, 3600)
+               minutes, seconds = divmod(minutes, 60)
+               uptime = f"Uptime: {days}d {hours}h {minutes}m {seconds}s"
+               await interaction.response.send_message(uptime)
+
     async def start(self):
         try:
             logger.info("Starting ClaudeBot...")
