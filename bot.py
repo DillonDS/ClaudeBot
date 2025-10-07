@@ -118,7 +118,20 @@ class ClaudeBot:
             await self.moderate_message(message)
 
             await self.bot.process_commands(message) 
-
+    
+    def detect_image_type(self, image_data: bytes) -> str: 
+        if image_data.startswith(b'\xff\xd8\xff'):
+            return 'image/jpeg'
+        elif image_data.startswith(b'\x89PNG\r\n\x1a\n'):
+            return 'image/png'
+        elif image_data.startswith(b'RIFF') and image_data[8:12] == b'WEBP':
+            return 'image/webp'
+        elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
+            return 'image/gif'
+        else:
+            logger.warning("Could not detect image type, defaulting to image/png")
+            return 'image/png'
+        
     async def handle_mention(self, message: discord.Message): 
         try:  
             # Message content logic 
@@ -127,39 +140,65 @@ class ClaudeBot:
                 await message.reply(f"You mentioned me with an empty message bozo <a:emote_name:1423865523011190795>")
                 return
             
-            # Reply context logic
+            claude_content = []
+            # Reply context logic 
             if message.reference:
                 referenced_message = await message.channel.fetch_message(message.reference.message_id)
-                if referenced_message and referenced_message.author != self.bot.user:
+                if referenced_message:
+                    # Add the referenced text content
                     referenced_content = referenced_message.content
-                    message_content = f"Context: The user is replying to: {referenced_content}\n\nUser's Message: {message_content}" 
-                # include logic to include image if reply references an image
-            
-            # Claude content assembly
-            claude_content = [
-                {
-                    "type": "text",
-                    "text": message_content
-                }
-            ]
-            
-            # Image logic
+                    if referenced_content:
+                        context_text = f"Context: The user is replying to this message:\n{referenced_content}"
+                    else:
+                        context_text = "Context: The user is replying to an image:"
+
+                    claude_content.append({
+                        "type": "text",
+                        "text": context_text
+                    })
+                    # Add referenced image
+                    if referenced_message.attachments:
+                        for attachment in referenced_message.attachments:
+                            if attachment.content_type and attachment.content_type.startswith('image/'):
+                                image_data = await attachment.read()
+                                base64_image = base64.b64encode(image_data).decode('utf-8')
+                                # Detect actual media type from image data
+                                media_type = self.detect_image_type(image_data)
+                                claude_content.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": base64_image
+                                    }
+                                })
+
+            # Add current message 
+            claude_content.append({
+                "type": "text",
+                "text": f"User's message: {message_content}" if message.reference else message_content
+            })
+
+            # Add current message images
             if message.attachments:
                 for attachment in message.attachments:
                     if attachment.content_type and attachment.content_type.startswith('image/'):
                         image_data = await attachment.read()
                         base64_image = base64.b64encode(image_data).decode('utf-8')
+                        # Detect actual media type from image data
+                        media_type = self.detect_image_type(image_data)
                         claude_content.append({
                             "type": "image",
                             "source": {
                                 "type": "base64",
-                                "media_type": attachment.content_type,
+                                "media_type": media_type,
                                 "data": base64_image
                             }
                         })
                     else:
                         logger.info(f"Skipping non-image attachment: {attachment.filename}")
-                    
+                        
+            # mr claude typing while processing     
             async with message.channel.typing():
                 response = await self.claude_response(claude_content)
             
