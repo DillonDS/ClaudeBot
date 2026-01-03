@@ -129,12 +129,17 @@ celerybeat.pid
 
 # Environments
 .env
+.env.production
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Bot data files
+bot_data.json
+conversation_cache.json
 
 # Spyder project settings
 .spyderproject
@@ -179,3 +184,4 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+bot.py.backup(old)
