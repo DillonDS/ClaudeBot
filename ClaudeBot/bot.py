@@ -6,11 +6,13 @@ from typing import Optional
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import anthropic
 import boto3
 from dotenv import load_dotenv
 import base64
+
+from config_manager import ConfigManager
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +30,7 @@ class ClaudeBot:
     per channel and responds based on self-scoring.
     """
 
-    # Configuration constants
+    # Default configuration constants (fallbacks - actual values come from ConfigManager)
     MAX_TOKENS_PER_CHANNEL = 150000        # 150k token limit per channel
     MESSAGE_EXPIRY_DAYS = 30                # Remove messages older than 30 days
     CHARS_PER_TOKEN_ESTIMATE = 4            # Rough estimate for token counting
@@ -47,9 +49,12 @@ class ClaudeBot:
         self.bot: Optional[commands.Bot] = None
         self.start_time: Optional[datetime] = None
 
+        # Initialize config manager for per-guild settings
+        self.config_manager = ConfigManager()
+
         # Conversation cache: category_name -> channel_id -> list of messages
         # Each message: {"user": str, "content": str, "timestamp": datetime,
-        #                "mentioned_bot": bool, "channel_name": str}
+        #                "mentioned_bot": bool, "channel_name": str, "guild_id": str}
         self.conversation_cache = defaultdict(lambda: defaultdict(list))
 
         # Rate limiting: channel_id -> last response timestamp
@@ -174,7 +179,7 @@ class ClaudeBot:
                 len(msgs) for channels in self.conversation_cache.values()
                 for msgs in channels.values()
             )
-            logger.info(f"Saved {total_msgs} messages to cache file")
+            logger.info(f"Saved {total_msgs} messages to cache file\n")
         except Exception as e:
             logger.error(f"Error saving cache: {e}")
 
@@ -316,8 +321,22 @@ class ClaudeBot:
                 if self.start_time is None:
                     self.start_time = datetime.now(timezone.utc)
                     logger.info(f"Bot started at {self.start_time}")
+
+                # Start stats writing background task
+                if not self.write_stats_task.is_running():
+                    self.write_stats_task.start()
             except Exception as e:
                 logger.error(f"Failed to setup events: {e}")
+
+        @tasks.loop(seconds=30)
+        async def write_stats_loop():
+            """Background task to write stats for dashboard."""
+            try:
+                self.config_manager.write_stats(self.bot, self.conversation_cache)
+            except Exception as e:
+                logger.error(f"Error in stats loop: {e}")
+
+        self.write_stats_task = write_stats_loop
 
         @self.bot.event
         async def on_message(message: discord.Message):
@@ -365,13 +384,18 @@ class ClaudeBot:
             if not message_content and not message.attachments:
                 return
 
-            # Get channel info
+            # Get guild and channel info
+            guild_id = str(message.guild.id)
             category = message.channel.category.name if message.channel.category else "Uncategorized"
             channel_id = message.channel.id
             channel_name = message.channel.name
 
+            # Get per-guild settings
+            guild_config = self.config_manager.get_guild_config(guild_id)
+            skip_categories = self.config_manager.get_skip_categories(guild_id)
+
             # Skip categories we don't process
-            if category in self.SKIP_CATEGORIES:
+            if category in skip_categories:
                 logger.info(f"Skipping message in category: {category}({message.channel.category.id if message.channel.category else 'N/A'})")
                 return
             
@@ -464,14 +488,15 @@ class ClaudeBot:
                     })
 
             # Check rate limiting (skip if responded too recently, unless directly mentioned)
+            rate_limit_seconds = guild_config.get('rateLimitSeconds', self.RATE_LIMIT_SECONDS)
             last_response = self.last_response_time.get(channel_id)
             if last_response and not any_mention:
                 seconds_since = (datetime.now(timezone.utc) - last_response).total_seconds()
-                if seconds_since < self.RATE_LIMIT_SECONDS:
+                if seconds_since < rate_limit_seconds:
                     return  # Rate limited, skip Claude API call
 
-            # Get Claude's response
-            response = await self.get_claude_response(claude_content, channel_name, channel_id, current_msg)
+            # Get Claude's response (pass guild_id for per-guild settings)
+            response = await self.get_claude_response(claude_content, channel_name, channel_id, current_msg, guild_id)
 
             if response:
                 logger.info(f"Sending response in #{channel_name}")
@@ -495,53 +520,36 @@ class ClaudeBot:
     # =========================================================================
 
     async def get_claude_response(self, claude_content: list, channel_name: str,
-                                   channel_id: int, current_msg: str) -> Optional[str]:
+                                   channel_id: int, current_msg: str, guild_id: str) -> Optional[str]:
         """
         Send conversation to Claude and get a scored response.
         Returns None if score is below threshold.
         """
         try:
+            # Get per-guild settings
+            guild_config = self.config_manager.get_guild_config(guild_id)
+            temperature = guild_config.get('temperature', 0.7)
+            max_response_tokens = guild_config.get('maxResponseTokens', self.MAX_RESPONSE_TOKENS)
+            score_threshold = guild_config.get('scoreThreshold', self.SCORE_THRESHOLD)
+            model = guild_config.get('model', 'claude-sonnet-4-5-20250929')
+
+            # Get system prompt (custom or default)
+            prompt_text = self.config_manager.get_system_prompt(guild_id)
+
             # System prompt with cache_control for prompt caching
-            # Using array format to enable caching
             system_prompt = [
                 {
                     "type": "text",
-                    "text": """You are a helpful, witty Discord bot in a casual server.
-
-RESPONSE RULES:
-- Keep responses to 1-3 sentences MAX. Be brief.
-- Aim to be the 5th-6th most active participant in server (your name is "ClaudeBot" in "Recent Conversation:") 
-- Use recent conversation and if you notice you haven't chatted in awhile, raise your score accordingly. For example: if you haven't chatted in 10+ messages, increase your score 
-- Most conversations don't need your input - only add high value responses
-- Only respond if directly mentioned OR you can add genuinely valuable input
-- NEVER end with follow-up questions
-
-MENTION FORMAT:
-- Messages starting with [MENTIONED] mean the user addressed you (@ClaudeBot or "ClaudeBot") These deserve a response (score 9+)
-- Note: "claude" alone is ambiguous (could mean Claude AI service or ClaudeBot) - use context to decide if they're referring to you the discord bot
-
-SCORING (rate your response 0-10):
-10 = [MENTIONED] AND asked a clear question you can answer
-9 = [MENTIONED] OR celebrate someone's accomplishment (promotion, graduation, new job, etc.)
-8 = Can provide high value wile staying the 5th-6th most active participant (check "Recent conversation:" to ensure you're staying active)
-5-7 = Might be interesting but doesn't need your input
-0-4 = Skip it - normal chat between other users
-
-CATEGORY CONTEXT:
-- "Information" = NEVER respond (score 0)
-- "tech-and-career" = Usually networking. BUT celebrate accomplishments/good news! (score 8)
-- "Text Channels" = May engage if valuable
-
-FORMAT: Write your brief response, then on a new line: SCORE: X""",
+                    "text": prompt_text,
                     "cache_control": {"type": "ephemeral"}
                 }
             ]
 
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
-                model="claude-sonnet-4-5-20250929",
-                max_tokens=self.MAX_RESPONSE_TOKENS,
-                temperature=0.7,
+                model=model,
+                max_tokens=max_response_tokens,
+                temperature=temperature,
                 system=system_prompt,
                 messages=[{
                     "role": "user",
@@ -554,9 +562,9 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
 
             # Log with channel name and ID for debugging
             msg_preview = current_msg[:150]
-            logger.info(f"[SCORE: {score}] #{channel_name} ({channel_id}) {msg_preview}..." + "\n\n")
+            logger.info(f"[SCORE: {score}] #{channel_name} ({channel_id}) {msg_preview}..." + "\n")
 
-            if score is not None and score < self.SCORE_THRESHOLD:
+            if score is not None and score < score_threshold:
                 return None
 
             # Remove SCORE line from response
@@ -624,6 +632,14 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
 
         @self.bot.tree.command(name="beer", description="Share a beer with ClaudeBot")
         async def beer_command(interaction: discord.Interaction):
+            # Check if command is enabled for this guild
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            if guild_id and not self.config_manager.is_command_enabled(guild_id, "beer"):
+                await interaction.response.send_message(
+                    "This command is disabled for this server.", ephemeral=True
+                )
+                return
+
             nonlocal beer_counter
             try:
                 beer_counter += 1
@@ -642,11 +658,27 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
 
         @self.bot.tree.command(name="ping", description="Check bot latency")
         async def ping_command(interaction: discord.Interaction):
+            # Check if command is enabled for this guild
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            if guild_id and not self.config_manager.is_command_enabled(guild_id, "ping"):
+                await interaction.response.send_message(
+                    "This command is disabled for this server.", ephemeral=True
+                )
+                return
+
             latency = round(self.bot.latency * 1000)  # Convert to ms
             await interaction.response.send_message(f"Pong! {latency}ms")
 
         @self.bot.tree.command(name="uptime", description="Check bot uptime")
         async def uptime_command(interaction: discord.Interaction):
+            # Check if command is enabled for this guild
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            if guild_id and not self.config_manager.is_command_enabled(guild_id, "uptime"):
+                await interaction.response.send_message(
+                    "This command is disabled for this server.", ephemeral=True
+                )
+                return
+
             if self.start_time:
                 delta = datetime.now(timezone.utc) - self.start_time
                 days = delta.days
@@ -665,6 +697,14 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
             interaction: discord.Interaction,
             channel: Optional[discord.TextChannel] = None
         ):
+            # Check if command is enabled for this guild
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            if guild_id and not self.config_manager.is_command_enabled(guild_id, "cacheStats"):
+                await interaction.response.send_message(
+                    "This command is disabled for this server.", ephemeral=True
+                )
+                return
+
             # If specific channel requested
             if channel:
                 category = channel.category.name if channel.category else "Uncategorized"
@@ -716,6 +756,14 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
             interaction: discord.Interaction,
             channel: Optional[discord.TextChannel] = None
         ):
+            # Check if command is enabled for this guild
+            guild_id = str(interaction.guild_id) if interaction.guild_id else None
+            if guild_id and not self.config_manager.is_command_enabled(guild_id, "clearCache"):
+                await interaction.response.send_message(
+                    "This command is disabled for this server.", ephemeral=True
+                )
+                return
+
             if channel:
                 # Clear specific channel
                 category = channel.category.name if channel.category else "Uncategorized"

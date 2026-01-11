@@ -1,0 +1,25 @@
+{
+  "guildId": "REPLACE_WITH_GUILD_ID",
+  "guildName": "Example Server",
+  "settings": {
+    "maxTokensPerChannel": 150000,
+    "messageExpiryDays": 30,
+    "charsPerTokenEstimate": 4,
+    "maxResponseTokens": 300,
+    "scoreThreshold": 8,
+    "rateLimitSeconds": 2,
+    "temperature": 0.7,
+    "model": "claude-sonnet-4-5-20250929",
+    "skipCategories": ["Information"]
+  },
+  "commands": {
+    "beer": true,
+    "ping": true,
+    "uptime": true,
+    "cacheStats": true,
+    "clearCache": true
+  },
+  "systemPrompt": null,
+  "updatedAt": "2025-01-04T00:00:00.000Z",
+  "updatedBy": "system"
+}
