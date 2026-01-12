@@ -14,7 +14,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -233,3 +232,6 @@ next-env.d.ts
 # Ignore guild configs except the example
 ClaudeBot/guild_configs/*.json
 !ClaudeBot/guild_configs/example.json
+
+# Personal todo
+TODO.md

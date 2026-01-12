@@ -60,7 +60,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
       guildId,
       access.guildName!,
       body.settings,
-      session.user.id
+      session.user!.id!
     )
     return NextResponse.json(config)
   } catch (error) {

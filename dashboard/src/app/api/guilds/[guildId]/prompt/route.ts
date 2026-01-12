@@ -67,7 +67,7 @@ export async function PUT(request: Request, { params }: RouteParams) {
       guildId,
       access.guildName!,
       promptValue,
-      session.user.id
+      session.user!.id!
     )
     return NextResponse.json({
       systemPrompt: config.systemPrompt,
