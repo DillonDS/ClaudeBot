@@ -29,16 +29,21 @@ class ClaudeBot:
     """
 
     # Configuration constants
-    MAX_TOKENS_PER_CHANNEL = 150000        # 150k token limit per channel
-    MESSAGE_EXPIRY_DAYS = 30                # Remove messages older than 30 days
+    MAX_TOKENS_PER_CHANNEL = 10000          # 10k token limit per channel (storage)
+    MESSAGE_EXPIRY_DAYS = 12                # Remove messages older than 12 days
     CHARS_PER_TOKEN_ESTIMATE = 4            # Rough estimate for token counting
     MAX_RESPONSE_TOKENS = 300               # Keep responses brief
-    SCORE_THRESHOLD = 8                     # Only respond if score >= 8
-    RATE_LIMIT_SECONDS = 2                  # Minimum seconds between responses per channel
+    SCORE_THRESHOLD = 9                     # Only respond if score >= 9
     CACHE_FILE = 'conversation_cache.json'  # Persistent cache file
+
+    # Batching and context limits
+    BATCH_WINDOW_SECONDS = 5                # Collect messages for 5 seconds before processing
+    HAIKU_CONTEXT_TOKENS = 1000             # ~1k tokens to Haiku for scoring
+    SONNET_CONTEXT_TOKENS = 2000            # ~2k tokens to Sonnet for response
 
     # Categories to skip conversation history
     SKIP_CATEGORIES = {"Information"}
+    SKIP_CHANNELS = {"readings", "github-profiles", "linkedin"}
 
     def __init__(self):
         self.discord_token: Optional[str] = None
@@ -48,12 +53,11 @@ class ClaudeBot:
         self.start_time: Optional[datetime] = None
 
         # Conversation cache: category_name -> channel_id -> list of messages
-        # Each message: {"user": str, "content": str, "timestamp": datetime,
-        #                "mentioned_bot": bool, "channel_name": str}
         self.conversation_cache = defaultdict(lambda: defaultdict(list))
 
-        # Rate limiting: channel_id -> last response timestamp
-        self.last_response_time: dict[int, datetime] = {}
+        # Batching: collect messages before processing
+        self.pending_messages: dict[int, list[dict]] = {}  # channel_id -> list of message data
+        self.batch_tasks: dict[int, asyncio.Task] = {}     # channel_id -> pending batch task
 
         # Load persistent cache on startup
         self.load_cache()
@@ -219,29 +223,56 @@ class ClaudeBot:
         while self.get_channel_token_count(category, channel_id) > self.MAX_TOKENS_PER_CHANNEL:
             messages = self.conversation_cache[category][channel_id]
             if messages:
-                removed = messages.pop(0)  # Remove oldest message
-                logger.info(f"Removed old message to stay under token limit")
+                messages.pop(0)  # Remove oldest message
+                logger.info("Removed old message to stay under token limit")
             else:
                 break
 
-    def add_message_to_cache(self, message: discord.Message, mentioned_bot: bool):
+    def add_message_to_cache(self, message: discord.Message,
+                             reply_author: str = None, reply_content: str = None,
+                             reply_has_images: bool = False):
         """Add a message to the conversation cache."""
-        category = message.channel.category.name if message.channel.category else "Uncategorized"
-
-        # Skip categories add message to cache
+        category = message.channel.category.name if message.channel.category else "Uncategorized" 
+        
+        # Skip adding to cache 
         if category in self.SKIP_CATEGORIES:
             return
-
+        
         channel_id = message.channel.id
         channel_name = message.channel.name
+
+        if channel_name in self.SKIP_CHANNELS:
+            return
+        
+        # Truncate reply content if too long
+        if reply_content and len(reply_content) > 50:
+            reply_content = reply_content[:50] + "..."
+
+        
+        # Add image marker if replying to an image
+        if reply_has_images and reply_content:
+            reply_content += " [image]"
+        elif reply_has_images:
+            reply_content = "[image]"
+
+        # Build content with image marker if message has images
+        content = message.content.strip()
+        image_count = sum(
+            1 for att in message.attachments
+            if att.content_type and att.content_type.startswith('image/')
+        )
+        if image_count:
+            marker = f" [shared {image_count} image{'s' if image_count > 1 else ''}]"
+            content += marker
 
         # Create message entry
         msg_entry = {
             "user": message.author.display_name,
-            "content": message.content.strip(),
+            "content": content,
             "timestamp": datetime.now(timezone.utc),
-            "mentioned_bot": mentioned_bot,
-            "channel_name": channel_name
+            "channel_name": channel_name,
+            "reply_author": reply_author,
+            "reply_content": reply_content
         }
 
         # Add to cache
@@ -251,11 +282,6 @@ class ClaudeBot:
         self.cleanup_old_messages(category, channel_id)
         self.enforce_token_limit(category, channel_id)
 
-        # Save cache (every 10 messages)
-        total_msgs = sum(len(msgs) for ch in self.conversation_cache.values() for msgs in ch.values())
-        if total_msgs % 10 == 0:
-            self.save_cache()
-
     def add_bot_response_to_cache(self, message: discord.Message):
         """Add ClaudeBot's own response to cache for context continuity."""
         if not message.channel.category:
@@ -263,20 +289,26 @@ class ClaudeBot:
         else:
             category = message.channel.category.name
 
-        # Skip categories add bot response to cache
+        # Skip adding to cache for these categories
         if category in self.SKIP_CATEGORIES:
             return
 
-        channel_id = message.channel.id
         channel_name = message.channel.name
+
+        # Skip specific channels
+        if channel_name in self.SKIP_CHANNELS:
+            return
+
+        channel_id = message.channel.id
 
         # Use "ClaudeBot" in conversation history
         msg_entry = {
             "user": "ClaudeBot",
             "content": message.content.strip(),
             "timestamp": datetime.now(timezone.utc),
-            "mentioned_bot": False,
-            "channel_name": channel_name
+            "channel_name": channel_name,
+            "reply_author": None,
+            "reply_content": None
         }
 
         self.conversation_cache[category][channel_id].append(msg_entry)
@@ -287,7 +319,6 @@ class ClaudeBot:
         """Build formatted conversation history for Claude."""
         category = message.channel.category.name if message.channel.category else "Uncategorized"
         channel_id = message.channel.id
-        channel_name = message.channel.name
 
         messages = self.conversation_cache[category][channel_id]
 
@@ -295,11 +326,28 @@ class ClaudeBot:
             return ""
 
         # Format conversation history
-        lines = [f"[#{channel_name} in {category}]", "Recent conversation:"]
+        lines = []
         for msg in messages:
-            lines.append(f"{msg['user']}: {msg['content']}")
+            reply_author = msg.get('reply_author')
+            reply_content = msg.get('reply_content')
+
+            if reply_author:
+                if reply_content:
+                    lines.append(f'{msg["user"]} [replying to {reply_author}: "{reply_content}"]: {msg["content"]}')
+                else:
+                    lines.append(f'{msg["user"]} [replying to {reply_author}]: {msg["content"]}')
+            else:
+                lines.append(f"{msg['user']}: {msg['content']}")
 
         return "\n".join(lines)
+
+    def get_trimmed_history(self, message: discord.Message, max_tokens: int) -> str:
+        """Get conversation history trimmed to max_tokens (keeps most recent)."""
+        history = self.get_conversation_history(message)
+        # Trim from the start (oldest) to fit within limit, keeping newest
+        while self.estimate_tokens(history) > max_tokens and '\n' in history:
+            history = history.split('\n', 1)[1]
+        return history
 
     # =========================================================================
     # Discord Event Handlers
@@ -343,7 +391,7 @@ class ClaudeBot:
             return 'image/jpeg'
         elif image_data.startswith(b'\x89PNG\r\n\x1a\n'):
             return 'image/png'
-        elif image_data.startswith(b'RIFF') and image_data[8:12] == b'WEBP':
+        elif len(image_data) >= 12 and image_data.startswith(b'RIFF') and image_data[8:12] == b'WEBP':
             return 'image/webp'
         elif image_data.startswith(b'GIF87a') or image_data.startswith(b'GIF89a'):
             return 'image/gif'
@@ -355,7 +403,7 @@ class ClaudeBot:
     # =========================================================================
 
     async def handle_message(self, message: discord.Message):
-        """Process incoming messages and potentially respond."""
+        """Add message to batch for processing."""
         try:
             # Ignore DMs
             if not message.guild:
@@ -368,58 +416,61 @@ class ClaudeBot:
             # Get channel info
             category = message.channel.category.name if message.channel.category else "Uncategorized"
             channel_id = message.channel.id
-            channel_name = message.channel.name
 
             # Skip categories we don't process
             if category in self.SKIP_CATEGORIES:
-                logger.info(f"Skipping message in category: {category}({message.channel.category.id if message.channel.category else 'N/A'})")
+                logger.info(f"Skipping message in category: {category}")
                 return
-            
-            
+
+            # Skip specific channels
+            channel_name = message.channel.name
+            if channel_name in self.SKIP_CHANNELS:
+                logger.info(f"Skipping message in channel: {channel_name}")
+                return
+
             # # only reply to this guild for testing
             # if message.guild.id != :
             #     logger.info(f"Skipping message in guild: {message.guild.id} - {message.guild.name}")
             #     return
 
             # Check if bot was mentioned
-            # @ mention = "claudebot"/"claude bot" = definite, "claude" alone = ambiguous
             was_mentioned = self.bot.user in message.mentions
             content_lower = message_content.lower()
-            text_mentioned = 'claudebot' in content_lower or 'claude bot' in content_lower 
+            text_mentioned = 'claudebot' in content_lower or 'claude bot' in content_lower
             any_mention = was_mentioned or text_mentioned
 
-            # Build content for Claude
-            claude_content = []
+            # Build message data for batch
+            msg_data = {
+                "user": message.author.display_name,
+                "content": message_content,
+                "message_obj": message,
+                "mentioned": any_mention,
+                "reply_author": None,
+                "reply_content": None,
+                "reply_has_images": False,
+                "reply_images": [],
+                "images": []
+            }
 
-            # Add reply context if this is a reply
+            # Capture reply context if this is a reply
             if message.reference:
                 try:
                     referenced_message = await message.channel.fetch_message(message.reference.message_id)
                     if referenced_message:
-                        ref_content = referenced_message.content
-                        has_images = any(
+                        msg_data["reply_author"] = referenced_message.author.display_name
+                        msg_data["reply_content"] = referenced_message.content or None
+                        msg_data["reply_has_images"] = any(
                             att.content_type and att.content_type.startswith('image/')
                             for att in referenced_message.attachments
                         )
 
-                        if ref_content and has_images:
-                            context = f"[Replying to {referenced_message.author.display_name}'s message with image(s): {ref_content}]"
-                        elif ref_content:
-                            context = f"[Replying to {referenced_message.author.display_name}: {ref_content}]"
-                        elif has_images:
-                            context = f"[Replying to {referenced_message.author.display_name}'s image]"
-                        else:
-                            context = f"[Replying to {referenced_message.author.display_name}]"
-
-                        claude_content.append({"type": "text", "text": context})
-
-                        # Add referenced images
+                        # Capture referenced images
                         for attachment in referenced_message.attachments:
                             if attachment.content_type and attachment.content_type.startswith('image/'):
                                 image_data = await attachment.read()
                                 base64_image = base64.b64encode(image_data).decode('utf-8')
                                 media_type = self.detect_image_type(image_data)
-                                claude_content.append({
+                                msg_data["reply_images"].append({
                                     "type": "image",
                                     "source": {
                                         "type": "base64",
@@ -430,31 +481,13 @@ class ClaudeBot:
                 except Exception as e:
                     logger.warning(f"Could not fetch referenced message: {e}")
 
-            # Get conversation history BEFORE adding current message (to avoid duplication)
-            history = self.get_conversation_history(message)
-
-            # Add current message to cache for future context
-            self.add_message_to_cache(message, any_mention)
-
-            # Build current message with context
-            mention_marker = "[MENTIONED] " if any_mention else ""
-            current_msg = f"{mention_marker}{message.author.display_name}: {message_content}"
-
-            # Combine history and current message
-            if history:
-                full_context = f"{history}\n\n[Latest message - decide if you should respond based on context above]\n{current_msg}"
-            else:
-                full_context = f"[#{channel_name} in {category}]\n{current_msg}"
-
-            claude_content.append({"type": "text", "text": full_context})
-
-            # Add current message images
+            # Capture current message images
             for attachment in message.attachments:
                 if attachment.content_type and attachment.content_type.startswith('image/'):
                     image_data = await attachment.read()
                     base64_image = base64.b64encode(image_data).decode('utf-8')
                     media_type = self.detect_image_type(image_data)
-                    claude_content.append({
+                    msg_data["images"].append({
                         "type": "image",
                         "source": {
                             "type": "base64",
@@ -463,79 +496,188 @@ class ClaudeBot:
                         }
                     })
 
-            # Check rate limiting (skip if responded too recently, unless directly mentioned)
-            last_response = self.last_response_time.get(channel_id)
-            if last_response and not any_mention:
-                seconds_since = (datetime.now(timezone.utc) - last_response).total_seconds()
-                if seconds_since < self.RATE_LIMIT_SECONDS:
-                    return  # Rate limited, skip Claude API call
+            # Add to pending batch
+            if channel_id not in self.pending_messages:
+                self.pending_messages[channel_id] = []
+            self.pending_messages[channel_id].append(msg_data)
 
-            # Get Claude's response
-            response = await self.get_claude_response(claude_content, channel_name, channel_id, current_msg)
+            # Start batch timer only if one isn't already running (5-second window)
+            if channel_id not in self.batch_tasks:
+                self.batch_tasks[channel_id] = asyncio.create_task(
+                    self.process_batch_after_delay(channel_id)
+                )
+
+        except Exception as e:
+            logger.error(f"Error handling message: {e}")
+
+    async def process_batch_after_delay(self, channel_id: int):
+        """Wait for batch window, then process accumulated messages."""
+        try:
+            await asyncio.sleep(self.BATCH_WINDOW_SECONDS)
+            await self.process_batch(channel_id)
+        except Exception as e:
+            logger.error(f"Error in batch delay: {e}")
+
+    async def process_batch(self, channel_id: int):
+        """Process all pending messages for a channel."""
+        if channel_id not in self.pending_messages:
+            return
+
+        batch = self.pending_messages.pop(channel_id)
+        if channel_id in self.batch_tasks:
+            del self.batch_tasks[channel_id]
+
+        if not batch:
+            return
+
+        try:
+            # Get channel info from first message
+            first_msg = batch[0]["message_obj"]
+            channel = first_msg.channel
+            category = channel.category.name if channel.category else "Uncategorized"
+            channel_name = channel.name
+
+            # Build content array maintaining proper order: text -> images for each message
+            latest_content = []
+
+            for msg_data in batch:
+                # Build the message line (with reply context if replying)
+                mention_marker = "[MENTIONED] " if msg_data["mentioned"] else ""
+
+                if msg_data["reply_author"]:
+                    # Build reply indicator: [replying to Alice: "content" + image]
+                    reply_parts = []
+                    if msg_data["reply_content"]:
+                        # Truncate reply content
+                        reply_text = msg_data["reply_content"]
+                        if len(reply_text) > 50:
+                            reply_text = reply_text[:50] + "..."
+                        reply_parts.append(f'"{reply_text}"')
+                    if msg_data["reply_has_images"]:
+                        reply_parts.append("image")
+
+                    reply_info = " + ".join(reply_parts) if reply_parts else "message"
+                    msg_text = f'{mention_marker}{msg_data["user"]} [replying to {msg_data["reply_author"]}: {reply_info}]: {msg_data["content"]}'
+                else:
+                    msg_text = f'{mention_marker}{msg_data["user"]}: {msg_data["content"]}'
+
+                latest_content.append({"type": "text", "text": msg_text})
+
+                # Add referenced images with label (if replying to an image)
+                if msg_data["reply_images"]:
+                    latest_content.append({"type": "text", "text": f"{msg_data['reply_author']}'s referenced image:"})
+                    latest_content.extend(msg_data["reply_images"])
+
+                # Add the message's own images with label
+                if msg_data["images"]:
+                    latest_content.append({"type": "text", "text": f"{msg_data['user']}'s image:"})
+                    latest_content.extend(msg_data["images"])
+
+            # Get trimmed history before adding batch to cache 
+            haiku_history = self.get_trimmed_history(first_msg, self.HAIKU_CONTEXT_TOKENS)
+            sonnet_history = self.get_trimmed_history(first_msg, self.SONNET_CONTEXT_TOKENS)
+
+            # Add all batch messages to cache (for future context)
+            for msg_data in batch:
+                self.add_message_to_cache(
+                    msg_data["message_obj"],
+                    msg_data.get("reply_author"),
+                    msg_data.get("reply_content"),
+                    msg_data.get("reply_has_images", False)
+                )
+
+            # Save cache after each batch
+            self.save_cache()
+
+            # Score with Haiku 
+            score = await self.score_message(haiku_history, latest_content, channel_name, category)
+
+            logger.info(f"[SCORE: {score}] #{channel_name} - {len(batch)} message(s) batched")
+            
+            if score is None or score < self.SCORE_THRESHOLD:
+                logger.info(f"Skipping response in #{channel_name} - Score: {score}")
+                return
+            
+            response = await self.generate_response(
+                sonnet_history, latest_content, channel_name, category)
 
             if response:
                 logger.info(f"Sending response in #{channel_name}")
-                await self.send_long_message(message.channel, response)
-                # Update rate limit tracker
-                self.last_response_time[channel_id] = datetime.now(timezone.utc)
-
-            print() 
+                await self.send_long_message(channel, response)
 
         except discord.errors.HTTPException as e:
             logger.error(f"Discord API error: {e}")
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
-            try:
-                await message.reply("Encountered an error processing your request.")
-            except:
-                logger.error("Failed to send error message to user")
+            logger.error(f"Error processing batch: {e}")
 
     # =========================================================================
     # Claude API Integration
     # =========================================================================
 
-    async def get_claude_response(self, claude_content: list, channel_name: str,
-                                   channel_id: int, current_msg: str) -> Optional[str]:
-        """
-        Send conversation to Claude and get a scored response.
-        Returns None if score is below threshold.
-        """
+    async def score_message(self, history: str, latest_content: list,
+                            channel_name: str, category: str) -> Optional[int]:
+        """Score whether to respond using Haiku (cheap and fast)."""
         try:
-            # System prompt with cache_control for prompt caching
-            # Using array format to enable caching
-            system_prompt = [
-                {
-                    "type": "text",
-                    "text": """You are a helpful, witty Discord bot in a casual server.
+            # Build content: header, history, then latest messages with their images
+            content = [
+                {"type": "text", "text": f"""[#{channel_name} in {category}]
+Previous conversation:
+{history}
+
+[Latest message(s) - decide if ClaudeBot should respond]"""}
+            ]
+
+            # Add latest messages with their images in proper order
+            content.extend(latest_content)
+
+            # Add scoring instructions at the end
+            content.append({"type": "text", "text": """
+Score 0-10 whether ClaudeBot should respond:
+- 9-10: Directly mentioned ([MENTIONED]) or asked a clear question
+- 9: Good news to celebrate (promotion, graduation, new job, etc.)
+- 8-9: Can add high value while staying ~5th-6th most active (don't spam chat)
+- 5-7: Might be interesting but doesn't need input
+- 0-4: Normal chat, skip it
+
+Just output: SCORE: X"""})
+
+            response = await asyncio.to_thread(
+                self.claude_client.messages.create,
+                model="claude-haiku-3-5-20241022",
+                max_tokens=20,
+                messages=[{"role": "user", "content": content}]
+            )
+
+            return self.extract_score(response.content[0].text)
+
+        except Exception as e:
+            logger.error(f"Error scoring message: {e}")
+            return None
+
+    async def generate_response(self, history: str, latest_content: list,
+                                channel_name: str, category: str) -> Optional[str]:
+        """Generate response using Sonnet (only called when score >= threshold)."""
+        try:
+            # Build content: header, history, then latest messages with their images
+            content = [
+                {"type": "text", "text": f"""[#{channel_name} in {category}]
+Recent conversation:
+{history}
+
+[Latest message(s)]"""}
+            ]
+
+            # Add latest messages with their images in proper order
+            content.extend(latest_content)
+
+            system_prompt = """You are a helpful, witty Discord bot in a casual server.
 
 RESPONSE RULES:
 - Keep responses to 1-3 sentences MAX. Be brief.
-- Aim to be the 5th-6th most active participant in server (your name is "ClaudeBot" in "Recent Conversation:") 
-- Use recent conversation and if you notice you haven't chatted in awhile, raise your score accordingly. For example: if you haven't chatted in 10+ messages, increase your score 
-- Most conversations don't need your input - only add high value responses
-- Only respond if directly mentioned OR you can add genuinely valuable input
+- Only respond if you can add genuinely valuable input
 - NEVER end with follow-up questions
-
-MENTION FORMAT:
-- Messages starting with [MENTIONED] mean the user addressed you (@ClaudeBot or "ClaudeBot") These deserve a response (score 9+)
-- Note: "claude" alone is ambiguous (could mean Claude AI service or ClaudeBot) - use context to decide if they're referring to you the discord bot
-
-SCORING (rate your response 0-10):
-10 = [MENTIONED] AND asked a clear question you can answer
-9 = [MENTIONED] OR celebrate someone's accomplishment (promotion, graduation, new job, etc.)
-8 = Can provide high value wile staying the 5th-6th most active participant (check "Recent conversation:" to ensure you're staying active)
-5-7 = Might be interesting but doesn't need your input
-0-4 = Skip it - normal chat between other users
-
-CATEGORY CONTEXT:
-- "Information" = NEVER respond (score 0)
-- "tech-and-career" = Usually networking. BUT celebrate accomplishments/good news! (score 8)
-- "Text Channels" = May engage if valuable
-
-FORMAT: Write your brief response, then on a new line: SCORE: X""",
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ]
+- Match the casual tone of the conversation
+- If someone shares good news, celebrate with them!"""
 
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
@@ -543,31 +685,13 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
                 max_tokens=self.MAX_RESPONSE_TOKENS,
                 temperature=0.7,
                 system=system_prompt,
-                messages=[{
-                    "role": "user",
-                    "content": claude_content
-                }]
+                messages=[{"role": "user", "content": content}]
             )
 
-            response_text = response.content[0].text
-            score = self.extract_score(response_text)
-
-            # Log with channel name and ID for debugging
-            msg_preview = current_msg[:150]
-            logger.info(f"[SCORE: {score}] #{channel_name} ({channel_id}) {msg_preview}..." + "\n\n")
-
-            if score is not None and score < self.SCORE_THRESHOLD:
-                return None
-
-            # Remove SCORE line from response
-            lines = response_text.strip().split('\n')
-            filtered_lines = [line for line in lines if not line.strip().startswith("SCORE:")]
-            clean_response = '\n'.join(filtered_lines).strip()
-
-            return clean_response.lower() if clean_response else None
+            return response.content[0].text.strip()
 
         except Exception as e:
-            logger.error(f"Error getting Claude response: {e}")
+            logger.error(f"Error generating response: {e}")
             return None
 
     def extract_score(self, response: str) -> Optional[int]:
@@ -703,6 +827,8 @@ FORMAT: Write your brief response, then on a new line: SCORE: X""",
 
             if stats:
                 response = f"**Cache Stats:**\n" + "\n".join(stats[:10])
+                if len(stats) > 10:
+                    response += f"\n*(showing 10 of {len(stats)} channels)*"
                 response += f"\n\n**Total:** {total_messages} messages cached"
             else:
                 response = "No messages cached yet."

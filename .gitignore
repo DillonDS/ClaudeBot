@@ -140,6 +140,10 @@ venv.bak/
 # Bot data files
 bot_data.json
 conversation_cache.json
+TODO.md
+
+# Claude Code settings
+.claude/
 
 # Spyder project settings
 .spyderproject
