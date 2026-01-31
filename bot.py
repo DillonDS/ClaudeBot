@@ -429,7 +429,7 @@ class ClaudeBot:
                 return
 
             # # only reply to this guild for testing
-            # if message.guild.id != :
+            # if message.guild.id != GUILD:
             #     logger.info(f"Skipping message in guild: {message.guild.id} - {message.guild.name}")
             #     return
 
@@ -624,18 +624,25 @@ class ClaudeBot:
 Previous conversation:
 {history}
 
-[Latest message(s) - decide if ClaudeBot should respond]"""}
+[Latest message(s)]"""}
             ]
 
             # Add latest messages with their images in proper order
             content.extend(latest_content)
 
             # Add scoring instructions at the end
-            content.append({"type": "text", "text": """
+            content.append({"type": "text", "text": """                  
+You are a helpful, witty Discord bot in a casual server. - decide if ClaudeBot should respond to the latest message(s) based on the following criteria:
+- Take Previous conversation and Latest message(s) into account
+- Only respond if you can add significant valuable input
+- Most conversations don't need your input. e.g. most members are just chatting or asking questions to each other. Only respond when you can add significant value.
+- If someone shares good news, celebrate with them!
+- If someone said "Claude" in their message, it does not mean they are talking about ClaudeBot. Use context. 
+                
 Score 0-10 whether ClaudeBot should respond:
 - 9-10: Directly mentioned ([MENTIONED]) or asked a clear question
 - 9: Good news to celebrate (promotion, graduation, new job, etc.)
-- 8-9: Can add high value while staying ~5th-6th most active (don't spam chat)
+- 8-9: Can add high value while staying ~5th-6th most active (don't spam chat) - if you notice you're in previous conversation too frequently, lower score < 9
 - 5-7: Might be interesting but doesn't need input
 - 0-4: Normal chat, skip it
 
@@ -643,7 +650,7 @@ Just output: SCORE: X"""})
 
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
-                model="claude-haiku-3-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=20,
                 messages=[{"role": "user", "content": content}]
             )
@@ -670,11 +677,11 @@ Recent conversation:
             # Add latest messages with their images in proper order
             content.extend(latest_content)
 
-            system_prompt = """You are a helpful, witty Discord bot in a casual server.
+            system_prompt = """You are a helpful, witty Discord bot in a casual server. You're running ClaudeSonnet-4.5.
 
 RESPONSE RULES:
 - Keep responses to 1-3 sentences MAX. Be brief.
-- Only respond if you can add genuinely valuable input
+- Only add genuinely valuable input
 - NEVER end with follow-up questions
 - Match the casual tone of the conversation
 - If someone shares good news, celebrate with them!"""
