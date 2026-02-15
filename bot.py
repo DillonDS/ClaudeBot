@@ -33,17 +33,17 @@ class ClaudeBot:
     MESSAGE_EXPIRY_DAYS = 12                # Remove messages older than 12 days
     CHARS_PER_TOKEN_ESTIMATE = 4            # Rough estimate for token counting
     MAX_RESPONSE_TOKENS = 300               # Keep responses brief
-    SCORE_THRESHOLD = 9                     # Only respond if score >= 9
+    SCORE_THRESHOLD = 8                     # Only respond if score >= 8
     CACHE_FILE = 'conversation_cache.json'  # Persistent cache file
 
     # Batching and context limits
     BATCH_WINDOW_SECONDS = 5                # Collect messages for 5 seconds before processing
-    HAIKU_CONTEXT_TOKENS = 1000             # ~1k tokens to Haiku for scoring
-    SONNET_CONTEXT_TOKENS = 2000            # ~2k tokens to Sonnet for response
+    HAIKU_CONTEXT_TOKENS = 2000             # ~2k tokens to Haiku for scoring
+    SONNET_CONTEXT_TOKENS = 4500            # ~4.5k tokens to Sonnet for response
 
-    # Categories to skip conversation history
-    SKIP_CATEGORIES = {"Information"}
-    SKIP_CHANNELS = {"readings", "github-profiles", "linkedin"}
+    # Listen-only: cache messages for context, but only respond if mentioned
+    LISTEN_ONLY_CATEGORIES = {"Information"}
+    LISTEN_ONLY_CHANNELS = {"readings", "github-profiles", "linkedin"}
 
     def __init__(self):
         self.discord_token: Optional[str] = None
@@ -88,8 +88,10 @@ class ClaudeBot:
         """Retrieve Claude API key from AWS Secrets Manager."""
         try:
             region = os.getenv("AWS_REGION", "us-east-2")
-            client = boto3.client('secretsmanager', region_name=region)
             secret_name = os.getenv("AWS_SECRET_NAME")
+            if not secret_name:
+                raise ValueError("AWS_SECRET_NAME environment variable not set")
+            client = boto3.client('secretsmanager', region_name=region)
             response = client.get_secret_value(SecretId=secret_name)
             secret_data = json.loads(response['SecretString'])
             return secret_data['claude_api_key']
@@ -231,23 +233,14 @@ class ClaudeBot:
     def add_message_to_cache(self, message: discord.Message,
                              reply_author: str = None, reply_content: str = None,
                              reply_has_images: bool = False):
-        """Add a message to the conversation cache."""
-        category = message.channel.category.name if message.channel.category else "Uncategorized" 
-        
-        # Skip adding to cache 
-        if category in self.SKIP_CATEGORIES:
-            return
-        
+        """Add a message to the conversation cache (including listen-only channels for context)."""
+        category = message.channel.category.name if message.channel.category else "Uncategorized"
         channel_id = message.channel.id
         channel_name = message.channel.name
-
-        if channel_name in self.SKIP_CHANNELS:
-            return
         
         # Truncate reply content if too long
         if reply_content and len(reply_content) > 50:
             reply_content = reply_content[:50] + "..."
-
         
         # Add image marker if replying to an image
         if reply_has_images and reply_content:
@@ -289,16 +282,7 @@ class ClaudeBot:
         else:
             category = message.channel.category.name
 
-        # Skip adding to cache for these categories
-        if category in self.SKIP_CATEGORIES:
-            return
-
         channel_name = message.channel.name
-
-        # Skip specific channels
-        if channel_name in self.SKIP_CHANNELS:
-            return
-
         channel_id = message.channel.id
 
         # Use "ClaudeBot" in conversation history
@@ -364,6 +348,10 @@ class ClaudeBot:
                 if self.start_time is None:
                     self.start_time = datetime.now(timezone.utc)
                     logger.info(f"Bot started at {self.start_time}")
+
+                await self.bot.change_presence(
+                    activity=discord.Activity(type=discord.ActivityType.watching, name="chat")
+                )
             except Exception as e:
                 logger.error(f"Failed to setup events: {e}")
 
@@ -379,7 +367,6 @@ class ClaudeBot:
                 return
 
             await self.handle_message(message)
-            await self.bot.process_commands(message)
 
     # =========================================================================
     # Image Detection
@@ -413,20 +400,7 @@ class ClaudeBot:
             if not message_content and not message.attachments:
                 return
 
-            # Get channel info
-            category = message.channel.category.name if message.channel.category else "Uncategorized"
             channel_id = message.channel.id
-
-            # Skip categories we don't process
-            if category in self.SKIP_CATEGORIES:
-                logger.info(f"Skipping message in category: {category}")
-                return
-
-            # Skip specific channels
-            channel_name = message.channel.name
-            if channel_name in self.SKIP_CHANNELS:
-                logger.info(f"Skipping message in channel: {channel_name}")
-                return
 
             # # only reply to this guild for testing
             # if message.guild.id != GUILD:
@@ -537,6 +511,13 @@ class ClaudeBot:
             category = channel.category.name if channel.category else "Uncategorized"
             channel_name = channel.name
 
+            # Check if this is a listen-only channel
+            is_listen_only = (
+                category in self.LISTEN_ONLY_CATEGORIES or
+                channel_name in self.LISTEN_ONLY_CHANNELS
+            )
+            any_mentioned = any(msg_data["mentioned"] for msg_data in batch)
+
             # Build content array maintaining proper order: text -> images for each message
             latest_content = []
 
@@ -589,15 +570,28 @@ class ClaudeBot:
             # Save cache after each batch
             self.save_cache()
 
-            # Score with Haiku 
+            # Handle listen-only channels
+            if is_listen_only:
+                if not any_mentioned:
+                    logger.info(f"Listen-only #{channel_name} - no mention, skipping API calls")
+                    return
+                # Mentioned in listen-only channel: skip Haiku, go straight to Sonnet
+                logger.info(f"Listen-only #{channel_name} - mentioned, responding directly")
+                response = await self.generate_response(
+                    sonnet_history, latest_content, channel_name, category)
+                if response:
+                    await self.send_long_message(channel, response)
+                return
+
+            # Regular channel: Score with Haiku
             score = await self.score_message(haiku_history, latest_content, channel_name, category)
 
             logger.info(f"[SCORE: {score}] #{channel_name} - {len(batch)} message(s) batched")
-            
+
             if score is None or score < self.SCORE_THRESHOLD:
                 logger.info(f"Skipping response in #{channel_name} - Score: {score}")
                 return
-            
+
             response = await self.generate_response(
                 sonnet_history, latest_content, channel_name, category)
 
@@ -631,20 +625,21 @@ Previous conversation:
             content.extend(latest_content)
 
             # Add scoring instructions at the end
-            content.append({"type": "text", "text": """                  
+            content.append({"type": "text", "text": """
 You are a helpful, witty Discord bot in a casual server. - decide if ClaudeBot should respond to the latest message(s) based on the following criteria:
 - Take Previous conversation and Latest message(s) into account
-- Only respond if you can add significant valuable input
-- Most conversations don't need your input. e.g. most members are just chatting or asking questions to each other. Only respond when you can add significant value.
+- Only respond if you can add a valuable input OR be witty (be selective, not all messages need a response)
 - If someone shares good news, celebrate with them!
-- If someone said "Claude" in their message, it does not mean they are talking about ClaudeBot. Use context. 
-                
-Score 0-10 whether ClaudeBot should respond:
-- 9-10: Directly mentioned ([MENTIONED]) or asked a clear question
-- 9: Good news to celebrate (promotion, graduation, new job, etc.)
-- 8-9: Can add high value while staying ~5th-6th most active (don't spam chat) - if you notice you're in previous conversation too frequently, lower score < 9
-- 5-7: Might be interesting but doesn't need input
-- 0-4: Normal chat, skip it
+
+- 10: Directly mentioned ([MENTIONED]) - always respond
+- 9: Someone sharing big news worth celebrating (promotion, graduation, new job)
+- 8-9: Opportunity to be witty/funny, OR a question requiring expertise others maybe/likely don't have
+- 5-7: Simple questions anyone could answer, mild interest but not needed
+- 0-4: Normal chat, skip
+
+Note: If someone said "Claude" it doesn't mean they're talking to you. Check context.
+
+Frequency check: If ClaudeBot appears in the last 10 messages of "Previous conversation", subtract 2 from your score.
 
 Just output: SCORE: X"""})
 
@@ -677,14 +672,15 @@ Recent conversation:
             # Add latest messages with their images in proper order
             content.extend(latest_content)
 
-            system_prompt = """You are a helpful, witty Discord bot in a casual server. You're running ClaudeSonnet-4.5.
+            system_prompt = """you're claudebot, a chill member of this discord server. you run on claude sonnet 4.5.
 
-RESPONSE RULES:
-- Keep responses to 1-3 sentences MAX. Be brief.
-- Only add genuinely valuable input
-- NEVER end with follow-up questions
-- Match the casual tone of the conversation
-- If someone shares good news, celebrate with them!"""
+vibes:
+- keep it to 1-3 sentences max
+- be helpful when someone needs it, be funny/witty when there's an opening
+- match the energy of the chat
+- celebrate wins, roast bad takes, drop knowledge when relevant
+- never end with a question
+- type in all lowercase"""
 
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
@@ -717,6 +713,7 @@ RESPONSE RULES:
 
     async def send_long_message(self, channel: discord.TextChannel, content: str):
         """Send a message, splitting if it exceeds Discord's limit."""
+        content = content.lower()
         max_length = 2000
         try:
             if len(content) <= max_length:
