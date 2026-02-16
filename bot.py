@@ -5,6 +5,7 @@ import logging
 from typing import Optional
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands
 import anthropic
@@ -44,6 +45,9 @@ class ClaudeBot:
     # Listen-only: cache messages for context, but only respond if mentioned
     LISTEN_ONLY_CATEGORIES = {"Information"}
     LISTEN_ONLY_CHANNELS = {"readings", "github-profiles", "linkedin"}
+
+    # Timezone for conversation history dividers
+    DISPLAY_TIMEZONE = ZoneInfo("America/New_York")
 
     def __init__(self):
         self.discord_token: Optional[str] = None
@@ -158,7 +162,8 @@ class ClaudeBot:
             logger.warning(f"Error loading cache: {e}, starting fresh")
 
     def save_cache(self):
-        """Save conversation cache to file for persistence."""
+        """Save conversation cache to file using atomic write to prevent corruption."""
+        temp_file = self.CACHE_FILE + '.tmp'
         try:
             # Convert to regular dict and serialize datetimes
             data = {}
@@ -173,8 +178,12 @@ class ClaudeBot:
                         for msg in messages
                     ]
 
-            with open(self.CACHE_FILE, 'w') as f:
+            # Write to temp file first - if crash happens here, the original cache file is still intact
+            with open(temp_file, 'w') as f:
                 json.dump(data, f, indent=2)
+
+            # replaces cache file only after temp file is fully written
+            os.replace(temp_file, self.CACHE_FILE)
 
             total_msgs = sum(
                 len(msgs) for channels in self.conversation_cache.values()
@@ -183,6 +192,12 @@ class ClaudeBot:
             logger.info(f"Saved {total_msgs} messages to cache file")
         except Exception as e:
             logger.error(f"Error saving cache: {e}")
+            # Clean up temp file if it exists from a failed write
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    logger.warning(f"Could not clean up temp file: {temp_file}")
 
     # =========================================================================
     # Conversation Cache Management
@@ -299,6 +314,18 @@ class ClaudeBot:
         self.cleanup_old_messages(category, channel_id)
         self.enforce_token_limit(category, channel_id)
 
+    def format_hour(self, dt: datetime) -> str:
+        """Format a datetime's hour as '2pm', '12am', etc."""
+        hour = dt.hour
+        if hour == 0:
+            return "12am"
+        elif hour < 12:
+            return f"{hour}am"
+        elif hour == 12:
+            return "12pm"
+        else:
+            return f"{hour - 12}pm"
+
     def get_conversation_history(self, message: discord.Message) -> str:
         """Build formatted conversation history for Claude."""
         category = message.channel.category.name if message.channel.category else "Uncategorized"
@@ -309,9 +336,19 @@ class ClaudeBot:
         if not messages:
             return ""
 
-        # Format conversation history
+        # Format conversation history with hourly dividers
         lines = []
+        current_hour_key = None
+
         for msg in messages:
+            # Insert hourly divider when the hour changes
+            msg_time = msg['timestamp'].astimezone(self.DISPLAY_TIMEZONE)
+            hour_key = (msg_time.date(), msg_time.hour)
+            if hour_key != current_hour_key:
+                current_hour_key = hour_key
+                time_str = self.format_hour(msg_time)
+                lines.append(f"--- {msg_time.strftime('%b')} {msg_time.day}, {time_str} ET ---")
+
             reply_author = msg.get('reply_author')
             reply_content = msg.get('reply_content')
 
@@ -531,8 +568,8 @@ class ClaudeBot:
                     if msg_data["reply_content"]:
                         # Truncate reply content
                         reply_text = msg_data["reply_content"]
-                        if len(reply_text) > 50:
-                            reply_text = reply_text[:50] + "..."
+                        if len(reply_text) > 25:
+                            reply_text = reply_text[:25] + "..."
                         reply_parts.append(f'"{reply_text}"')
                     if msg_data["reply_has_images"]:
                         reply_parts.append("image")
@@ -570,20 +607,21 @@ class ClaudeBot:
             # Save cache after each batch
             self.save_cache()
 
-            # Handle listen-only channels
-            if is_listen_only:
-                if not any_mentioned:
-                    logger.info(f"Listen-only #{channel_name} - no mention, skipping API calls")
-                    return
-                # Mentioned in listen-only channel: skip Haiku, go straight to Sonnet
-                logger.info(f"Listen-only #{channel_name} - mentioned, responding directly")
+            # Handle listen-only channels: only respond if mentioned
+            if is_listen_only and not any_mentioned:
+                logger.info(f"Listen-only #{channel_name} - no mention, skipping API calls")
+                return
+
+            # If mentioned anywhere, skip Haiku and go straight to Sonnet
+            if any_mentioned:
+                logger.info(f"Mentioned in #{channel_name} - sending to Sonnet to respond directly")
                 response = await self.generate_response(
                     sonnet_history, latest_content, channel_name, category)
                 if response:
                     await self.send_long_message(channel, response)
                 return
 
-            # Regular channel: Score with Haiku
+            # Regular channel, no mention: Score with Haiku
             score = await self.score_message(haiku_history, latest_content, channel_name, category)
 
             logger.info(f"[SCORE: {score}] #{channel_name} - {len(batch)} message(s) batched")
@@ -608,26 +646,27 @@ class ClaudeBot:
     # Claude API Integration
     # =========================================================================
 
-    async def score_message(self, history: str, latest_content: list,
+    async def score_message(self, haiku_history: str, latest_content: list,
                             channel_name: str, category: str) -> Optional[int]:
         """Score whether to respond using Haiku (cheap and fast)."""
         try:
-            # Build content: header, history, then latest messages with their images
+            # Build content: header, history, then new messages with their images
             content = [
                 {"type": "text", "text": f"""[#{channel_name} in {category}]
 Previous conversation:
-{history}
+{haiku_history}
 
-[Latest message(s)]"""}
+[New messages]
+"""}
             ]
 
-            # Add latest messages with their images in proper order
+            # Add new messages with their images in proper order
             content.extend(latest_content)
 
             # Add scoring instructions at the end
             content.append({"type": "text", "text": """
-You are a helpful, witty Discord bot in a casual server. - decide if ClaudeBot should respond to the latest message(s) based on the following criteria:
-- Take Previous conversation and Latest message(s) into account
+You are a helpful, witty Discord bot in a casual server. - decide if ClaudeBot should respond to the new messages based on the following criteria:
+- Take Previous conversation and new messages into account
 - Only respond if you can add a valuable input OR be witty (be selective, not all messages need a response)
 - If someone shares good news, celebrate with them!
 
@@ -637,7 +676,7 @@ You are a helpful, witty Discord bot in a casual server. - decide if ClaudeBot s
 - 5-7: Simple questions anyone could answer, mild interest but not needed
 - 0-4: Normal chat, skip
 
-Note: If someone said "Claude" it doesn't mean they're talking to you. Check context.
+Note: If someone said "Claude" it doesn't mean they're talking to you. Check context to determine if they're talking about ClaudeBot or Claude the AI service.
 
 Frequency check: If ClaudeBot appears in the last 10 messages of "Previous conversation", subtract 2 from your score.
 
@@ -656,20 +695,21 @@ Just output: SCORE: X"""})
             logger.error(f"Error scoring message: {e}")
             return None
 
-    async def generate_response(self, history: str, latest_content: list,
+    async def generate_response(self, sonnet_history: str, latest_content: list,
                                 channel_name: str, category: str) -> Optional[str]:
         """Generate response using Sonnet (only called when score >= threshold)."""
         try:
-            # Build content: header, history, then latest messages with their images
+            # Build content: header, history, then new messages with their images
             content = [
                 {"type": "text", "text": f"""[#{channel_name} in {category}]
 Recent conversation:
-{history}
+{sonnet_history}
 
-[Latest message(s)]"""}
+[New messages]
+"""}
             ]
 
-            # Add latest messages with their images in proper order
+            # Add new messages with their images in proper order
             content.extend(latest_content)
 
             system_prompt = """you're claudebot, a chill member of this discord server. you run on claude sonnet 4.5.
