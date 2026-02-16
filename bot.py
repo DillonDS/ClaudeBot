@@ -624,7 +624,8 @@ class ClaudeBot:
             # Regular channel, no mention: Score with Haiku
             score = await self.score_message(haiku_history, latest_content, channel_name, category)
 
-            logger.info(f"[SCORE: {score}] #{channel_name} - {len(batch)} message(s) batched")
+            preview = " | ".join(m["content"][:15] for m in batch)
+            logger.info(f"[SCORE: {score}] #{channel_name} - {len(batch)} msg(s) - \"{preview}\"")
 
             if score is None or score < self.SCORE_THRESHOLD:
                 logger.info(f"Skipping response in #{channel_name} - Score: {score}")
