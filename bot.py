@@ -405,9 +405,6 @@ class ClaudeBot:
                     self.start_time = datetime.now(timezone.utc)
                     logger.info(f"Bot started at {self.start_time}")
 
-                await self.bot.change_presence(
-                    activity=discord.Activity(type=discord.ActivityType.watching, name="chat")
-                )
             except Exception as e:
                 logger.error(f"Failed to setup events: {e}")
 
