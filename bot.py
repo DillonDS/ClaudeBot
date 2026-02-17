@@ -11,6 +11,7 @@ from discord.ext import commands
 import anthropic
 import boto3
 from dotenv import load_dotenv
+import shutil
 import base64
 
 # Logging setup
@@ -198,6 +199,24 @@ class ClaudeBot:
                     os.remove(temp_file)
                 except OSError:
                     logger.warning(f"Could not clean up temp file: {temp_file}")
+
+    def backup_cache(self):
+        """Create a rolling backup of the cache file before destructive operations."""
+        # tmp file to avoid corruption
+        backup_file = self.CACHE_FILE + '.backup' 
+        temp_file = backup_file + '.tmp'
+        try:
+            if os.path.exists(self.CACHE_FILE):
+                shutil.copy2(self.CACHE_FILE, temp_file)
+                os.replace(temp_file, backup_file)
+                logger.info(f"Cache backup saved to {backup_file}")
+        except Exception as e:
+            logger.error(f"Error creating cache backup: {e}")
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
 
     # =========================================================================
     # Conversation Cache Management
@@ -887,6 +906,9 @@ vibes:
             interaction: discord.Interaction,
             channel: Optional[discord.TextChannel] = None
         ):
+            # Backup cache before any destructive operation
+            self.backup_cache()
+
             if channel:
                 # Clear specific channel
                 category = channel.category.name if channel.category else "Uncategorized"
@@ -915,6 +937,33 @@ vibes:
                     f"Cleared all cache ({total_msgs} messages across all channels)."
                 )
                 logger.info(f"All cache cleared by {interaction.user.display_name}")
+
+        @self.bot.tree.command(name="restore-cache", description="Restore cache from last backup")
+        @discord.app_commands.default_permissions(manage_messages=True)
+        async def restore_cache_command(interaction: discord.Interaction):
+            backup_file = self.CACHE_FILE + '.backup'
+            if not os.path.exists(backup_file):
+                await interaction.response.send_message("No backup file found.")
+                return
+
+            try:
+                shutil.copy2(backup_file, self.CACHE_FILE)
+                # Reload in-memory cache from restored file
+                self.conversation_cache.clear()
+                self.conversation_cache = defaultdict(lambda: defaultdict(list))
+                self.load_cache()
+
+                total_msgs = sum(
+                    len(msgs) for channels in self.conversation_cache.values()
+                    for msgs in channels.values()
+                )
+                await interaction.response.send_message(
+                    f"Cache restored from backup ({total_msgs} messages)."
+                )
+                logger.info(f"Cache restored from backup by {interaction.user.display_name}")
+            except Exception as e:
+                logger.error(f"Error restoring cache: {e}")
+                await interaction.response.send_message(f"Error restoring cache: {e}")
 
     # =========================================================================
     # Bot Startup
